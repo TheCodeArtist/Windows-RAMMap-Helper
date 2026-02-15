@@ -36,8 +36,11 @@ def get_resource_path(relative_path):
 class MemoryProgressBar(ttk.Frame):
     """Custom horizontal progress bar showing memory breakdown."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, app=None):
         super().__init__(parent)
+
+        # Store reference to main app for theme access
+        self.app = app
 
         # Title label
         self.title_label = ttk.Label(self, text="System Memory Breakdown:", font=("Segoe UI", 9, "bold"))
@@ -47,10 +50,6 @@ class MemoryProgressBar(ttk.Frame):
         self.canvas = tk.Canvas(self, height=30, bg="white", highlightthickness=1, highlightbackground="#cccccc")
         self.canvas.pack(fill="x", pady=(0, 4))
 
-        # Legend frame
-        legend_frame = ttk.Frame(self)
-        legend_frame.pack(anchor="w")
-
         # Color definitions matching Windows RAMMap
         self.colors = {
             "active": "#0078D4",      # Blue - Active memory
@@ -59,20 +58,8 @@ class MemoryProgressBar(ttk.Frame):
             "free": "#E0E0E0"         # Light gray - Free memory
         }
 
-        # Create legend items
+        # Store legend frame reference (will be populated externally)
         self.legend_labels = {}
-        col = 0
-        for name, color in self.colors.items():
-            # Color box
-            box = tk.Canvas(legend_frame, width=16, height=16, bg=color, highlightthickness=1, highlightbackground="#888888")
-            box.grid(row=0, column=col, padx=(0 if col == 0 else 12, 4), pady=2)
-
-            # Label
-            label = ttk.Label(legend_frame, text=f"{name.capitalize()}: 0 MB (0%)")
-            label.grid(row=0, column=col+1, pady=2)
-            self.legend_labels[name] = label
-
-            col += 2
 
         # Info label for total
         self.total_label = ttk.Label(self, text="Total: 0 MB", font=("Segoe UI", 8))
@@ -154,13 +141,49 @@ class MemoryProgressBar(ttk.Frame):
         # Update total label
         self.total_label.config(text=f"Total Physical Memory: {total} MB")
 
+    def update_theme(self, dark_mode):
+        """Update canvas colors based on theme."""
+        if dark_mode:
+            self.canvas.config(bg="#1e1e1e", highlightbackground="#3c3c3c")
+        else:
+            self.canvas.config(bg="white", highlightbackground="#cccccc")
+        self.update_display()
+
 
 class RamMapApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Windows RAMMap Helper")
-        self.geometry("620x480")
+
+        # Window size calculations
+        self.collapsed_height = 425  # Height when logs are hidden (just show button with padding)
+        self.expanded_height = 750   # Height when logs are shown (20 lines * ~15px + padding)
+
+        self.geometry(f"520x{self.collapsed_height}")
         self.resizable(False, False)
+
+        # Dark mode state
+        self.dark_mode = False
+
+        # Theme colors
+        self.themes = {
+            "light": {
+                "bg": "#f0f0f0",
+                "fg": "#000000",
+                "canvas_bg": "white",
+                "text_bg": "white",
+                "text_fg": "#000000",
+                "highlight": "#cccccc"
+            },
+            "dark": {
+                "bg": "#2b2b2b",
+                "fg": "#ffffff",
+                "canvas_bg": "#1e1e1e",
+                "text_bg": "#1e1e1e",
+                "text_fg": "#d4d4d4",
+                "highlight": "#3c3c3c"
+            }
+        }
 
         # Set window icon
         self._set_window_icon()
@@ -175,54 +198,142 @@ class RamMapApp(tk.Tk):
         # Hide window initially (will show after tray icon is created)
         self.withdraw()
 
-        root = ttk.Frame(self, padding=14)
+        root = ttk.Frame(self, padding=16)
         root.pack(fill="both", expand=True)
 
+        # Store root frame reference for theming
+        self.root_frame = root
+
+        # Header with improved typography and dark mode toggle
+        header_frame = ttk.Frame(root)
+        header_frame.pack(fill="x", pady=(0, 2))
+
         ttk.Label(
-            root,
+            header_frame,
             text="Windows Memory Maintenance",
-            font=("Segoe UI", 11, "bold"),
-        ).pack(anchor="w")
+            font=("Segoe UI", 12, "bold"),
+        ).pack(side="left", anchor="w")
+
+        # Dark mode toggle button in top-right
+        self.theme_toggle_button = tk.Button(
+            header_frame,
+            text="Light Mode",
+            command=self.toggle_theme,
+            width=12,
+            relief='raised',
+            borderwidth=1,
+            font=("Segoe UI", 9)
+        )
+        self.theme_toggle_button.pack(side="right", anchor="e")
 
         ttk.Label(
             root,
-            text="Trigger working set trimming and standby list purging on demand.",
-        ).pack(anchor="w", pady=(4, 12))
+            text="Trigger Working-set trimming and Standby-list purging on demand.",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 14))
 
         # Add memory progress bar
-        self.progress_bar = MemoryProgressBar(root)
-        self.progress_bar.pack(fill="x", pady=(0, 12))
+        self.progress_bar = MemoryProgressBar(root, app=self)
+        self.progress_bar.pack(fill="x", pady=(0, 16))
 
-        controls = ttk.Frame(root)
-        controls.pack(anchor="w", pady=(0, 10))
+        # Two-column layout: legend on left, buttons on right (centrally aligned)
+        content_frame = ttk.Frame(root)
+        content_frame.pack(pady=(0, 12))
 
-        self.trim_button = ttk.Button(
-            controls, text="Trim All Working Sets", command=self.on_trim
+        # Configure column weights for center alignment
+        content_frame.columnconfigure(0, weight=1)  # Left padding - expandable
+        content_frame.columnconfigure(1, weight=0)  # Legend column - fixed width
+        content_frame.columnconfigure(2, weight=0)  # Separator column
+        content_frame.columnconfigure(3, weight=0)  # Button column - fixed width
+        content_frame.columnconfigure(4, weight=1)  # Right padding - expandable
+
+        # Left column: Memory legend with grouped frame
+        legend_container = ttk.LabelFrame(content_frame, text="Memory Details", padding=(12, 8), relief="flat", borderwidth=0)
+        legend_container.grid(row=0, column=1, sticky="n", padx=(0, 0))
+
+        self.legend_frame = ttk.Frame(legend_container)
+        self.legend_frame.pack(fill="both", expand=True)
+
+        # Create legend items in the left column
+        self._create_legend()
+
+        # Vertical separator between columns
+        separator = ttk.Separator(content_frame, orient="vertical")
+        separator.grid(row=0, column=2, sticky="ns", padx=16)
+
+        # Right column: Action buttons with grouped frame
+        button_container = ttk.LabelFrame(content_frame, text="Memory Operations", padding=(12, 8), relief="flat", borderwidth=0)
+        button_container.grid(row=0, column=3, sticky="n", padx=(0, 0))
+
+        # Button styling
+        button_width = 24  # Slightly wider for better proportions
+        button_pady = 8    # Consistent spacing between buttons
+
+        # Use tk.Button instead of ttk.Button for proper color control in dark mode
+        self.trim_button = tk.Button(
+            button_container, text="Trim All Working Sets", width=button_width, command=self.on_trim,
+            relief='raised', borderwidth=1, font=("Segoe UI", 9)
         )
-        self.trim_button.grid(row=0, column=0, padx=(0, 8))
+        self.trim_button.grid(row=0, column=0, pady=(0, button_pady), sticky="ew")
 
-        self.modified_button = ttk.Button(
-            controls, text="Purge Modified List", command=self.on_purge_modified
+        self.modified_button = tk.Button(
+            button_container, text="Purge Modified List", width=button_width, command=self.on_purge_modified,
+            relief='raised', borderwidth=1, font=("Segoe UI", 9)
         )
-        self.modified_button.grid(row=0, column=1, padx=(0, 8))
+        self.modified_button.grid(row=1, column=0, pady=(0, button_pady), sticky="ew")
 
-        self.standby_button = ttk.Button(
-            controls, text="Purge Standby List", command=self.on_purge_standby
+        self.standby_button = tk.Button(
+            button_container, text="Purge Standby List", width=button_width, command=self.on_purge_standby,
+            relief='raised', borderwidth=1, font=("Segoe UI", 9)
         )
-        self.standby_button.grid(row=0, column=2, padx=(0, 8))
+        self.standby_button.grid(row=2, column=0, pady=(0, button_pady), sticky="ew")
 
-        self.refresh_button = ttk.Button(
-            controls, text="Refresh", command=self.refresh_memory_stats
+        self.refresh_button = tk.Button(
+            button_container, text="Refresh", width=button_width, command=self.refresh_memory_stats,
+            relief='raised', borderwidth=1, font=("Segoe UI", 9)
         )
-        self.refresh_button.grid(row=0, column=3)
+        self.refresh_button.grid(row=3, column=0, sticky="ew")
 
+        # Administrator status with better styling
         admin_status = is_admin()
         admin_text = "Yes" if admin_status else "No (run as Administrator recommended)"
-        self.admin_label = ttk.Label(root, text=f"Administrator mode: {admin_text}")
-        self.admin_label.pack(anchor="w", pady=(0, 8))
+        self.admin_label = ttk.Label(root, text=f"Administrator mode: {admin_text}",
+                                    font=("Segoe UI", 9))
+        self.admin_label.pack(anchor="w", pady=(12, 10))
 
-        self.log = tk.Text(root, height=10, wrap="word")
-        self.log.pack(fill="both", expand=True)
+        # Expandable logs section
+        logs_container = ttk.Frame(root)
+        logs_container.pack(fill="x", expand=False, pady=(0, 0))
+
+        # Logs header with toggle button
+        logs_header = ttk.Frame(logs_container)
+        logs_header.pack(fill="x", pady=(0, 0))
+
+        self.logs_expanded = False
+        self.logs_toggle_button = tk.Button(
+            logs_header,
+            text="▶ Show Logs",
+            command=self.toggle_logs,
+            width=15,
+            relief='raised',
+            borderwidth=1,
+            font=("Segoe UI", 9)
+        )
+        self.logs_toggle_button.pack(side="left", anchor="w")
+
+        # Logs content (initially hidden)
+        self.logs_content = ttk.Frame(logs_container)
+
+        # Create scrollbar for logs
+        logs_scrollbar = ttk.Scrollbar(self.logs_content)
+        logs_scrollbar.pack(side="right", fill="y")
+
+        self.log = tk.Text(self.logs_content, height=20, wrap="word", yscrollcommand=logs_scrollbar.set)
+        self.log.pack(side="left", fill="both", expand=True, pady=(4, 0))
+
+        # Connect scrollbar to text widget
+        logs_scrollbar.config(command=self.log.yview)
+
         self._write_log("Application ready.")
         self._log_diagnostics(admin_status)
 
@@ -234,6 +345,50 @@ class RamMapApp(tk.Tk):
 
         # Create system tray icon
         self.after(100, self._create_tray_icon)
+
+    def _create_legend(self) -> None:
+        """Create the memory legend items in the right column."""
+        # Configure grid for proper alignment
+        self.legend_frame.columnconfigure(0, weight=0)  # Color box column
+        self.legend_frame.columnconfigure(1, weight=1)  # Label column - expandable
+
+        # Store legend canvas boxes for theme updates
+        self.legend_boxes = {}
+
+        row = 0
+        legend_pady = 6  # Vertical spacing between legend items
+
+        for name, color in self.progress_bar.colors.items():
+            # Color box with better styling
+            box = tk.Canvas(self.legend_frame, width=18, height=18, bg=color,
+                          highlightthickness=1, highlightbackground="#666666")
+            box.grid(row=row, column=0, padx=(0, 8), pady=(0, legend_pady if row < 3 else 0), sticky="w")
+            self.legend_boxes[name] = box
+
+            # Label with improved font
+            label = ttk.Label(self.legend_frame, text=f"{name.capitalize()}: 0 MB (0%)",
+                            font=("Segoe UI", 9))
+            label.grid(row=row, column=1, pady=(0, legend_pady if row < 3 else 0), sticky="w")
+            self.progress_bar.legend_labels[name] = label
+
+            row += 1
+
+    def toggle_logs(self) -> None:
+        """Toggle the visibility of the logs section."""
+        if self.logs_expanded:
+            # Collapse logs
+            self.logs_content.pack_forget()
+            self.logs_toggle_button.config(text="▶ Show Logs")
+            self.logs_expanded = False
+            # Resize window to collapsed height
+            self.geometry(f"520x{self.collapsed_height}")
+        else:
+            # Expand logs
+            self.logs_content.pack(fill="both", expand=True, pady=(4, 0))
+            self.logs_toggle_button.config(text="▼ Hide Logs")
+            self.logs_expanded = True
+            # Resize window to expanded height
+            self.geometry(f"520x{self.expanded_height}")
 
     def _write_log(self, message: str) -> None:
         # Filter debug messages when DEBUG_MODE is False
@@ -555,3 +710,100 @@ class RamMapApp(tk.Tk):
 
         # Destroy the window
         self.after(0, self.destroy)
+
+    def toggle_theme(self) -> None:
+        """Toggle between dark mode and light mode."""
+        self.dark_mode = not self.dark_mode
+        theme = self.themes["dark"] if self.dark_mode else self.themes["light"]
+
+        # Update button text
+        if self.dark_mode:
+            self.theme_toggle_button.config(text=" Dark Mode")
+        else:
+            self.theme_toggle_button.config(text="Light Mode")
+
+        # Update main window background
+        self.config(bg=theme["bg"])
+
+        # Update text widget (logs)
+        self.log.config(bg=theme["text_bg"], fg=theme["text_fg"],
+                       insertbackground=theme["text_fg"])
+
+        # Update progress bar canvas
+        self.progress_bar.update_theme(self.dark_mode)
+
+        # Update legend boxes border
+        for name, box in self.legend_boxes.items():
+            if self.dark_mode:
+                box.config(highlightbackground="#555555")
+            else:
+                box.config(highlightbackground="#666666")
+
+        # Apply ttk style for dark/light mode without changing theme
+        # This prevents layout shifts by only updating colors, not the base theme
+        style = ttk.Style()
+        if self.dark_mode:
+            # Dark mode colors - light text on dark background for readability
+            style.configure('TFrame', background='#2b2b2b')
+            style.configure('TLabel', background='#2b2b2b', foreground='#e0e0e0')
+            style.configure('TLabelframe', background='#2b2b2b', foreground='#e0e0e0',
+                          borderwidth=0, relief='flat')
+            style.configure('TLabelframe.Label', background='#2b2b2b', foreground='#e0e0e0')
+
+            # Button styling with explicit dark background
+            style.configure('TButton',
+                          background='#404040',
+                          foreground='#ffffff',
+                          borderwidth=1,
+                          focuscolor='#505050',
+                          darkcolor='#2b2b2b',
+                          lightcolor='#555555',
+                          relief='raised')
+            style.map('TButton',
+                     background=[('disabled', '#2b2b2b'), ('active', '#505050'), ('pressed', '#303030')],
+                     foreground=[('disabled', '#666666'), ('active', '#ffffff'), ('pressed', '#ffffff')],
+                     bordercolor=[('active', '#606060')])
+            style.configure('TSeparator', background='#3c3c3c')
+        else:
+            # Light mode colors - dark text on light background for readability
+            style.configure('TFrame', background='#f0f0f0')
+            style.configure('TLabel', background='#f0f0f0', foreground='#000000')
+            style.configure('TLabelframe', background='#f0f0f0', foreground='#000000',
+                          borderwidth=0, relief='flat')
+            style.configure('TLabelframe.Label', background='#f0f0f0', foreground='#000000')
+
+            # Button styling with explicit light background
+            style.configure('TButton',
+                          background='#e1e1e1',
+                          foreground='#000000',
+                          borderwidth=1,
+                          relief='raised')
+            style.map('TButton',
+                     background=[('disabled', '#f0f0f0'), ('active', '#e5f1fb'), ('pressed', '#cce4f7')],
+                     foreground=[('disabled', '#a0a0a0'), ('active', '#000000'), ('pressed', '#000000')])
+            style.configure('TSeparator', background='#d9d9d9')
+
+        # Force update of all widgets to apply new styles immediately
+        self.update_idletasks()
+
+        # Directly set tk.Button colors for guaranteed dark mode support
+        if self.dark_mode:
+            # Dark mode: dark background, light text for all buttons
+            button_bg = '#404040'
+            button_fg = '#ffffff'
+            button_active_bg = '#505050'
+            button_active_fg = '#ffffff'
+        else:
+            # Light mode: light background, dark text for all buttons
+            button_bg = '#f0f0f0'
+            button_fg = '#000000'
+            button_active_bg = '#e5f1fb'
+            button_active_fg = '#000000'
+
+        # Apply colors to all buttons
+        for btn in [self.trim_button, self.modified_button, self.standby_button,
+                   self.refresh_button, self.logs_toggle_button, self.theme_toggle_button]:
+            btn.config(bg=button_bg, fg=button_fg,
+                      activebackground=button_active_bg, activeforeground=button_active_fg)
+
+        self._write_log(f"Theme switched to {'dark' if self.dark_mode else 'light'} mode.")
