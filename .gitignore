@@ -1,0 +1,21 @@
+# Python
+pyvenv
+__pycache__/
+*.py[cod]
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec.backup
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# PyInstaller
+*.spec.backup
+build/
+dist/

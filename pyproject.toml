@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windows-rammap"
+version = "0.1.0"
+description = "Simple Windows GUI utility to trim working sets and purge standby list."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "psutil>=5.9.0",
+  "pystray>=0.19.0",
+  "pillow>=10.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
