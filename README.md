@@ -2,6 +2,8 @@
 
 Simple Windows GUI application to manually trigger system memory management operations.
 
+![Windows RAMMap Helper Screenshot](windows-rammap-helper-screenshot.png)
+
 ## Features
 
 - **System Tray Integration**: Minimize-to-tray functionality with double-click to restore.
