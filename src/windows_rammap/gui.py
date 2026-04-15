@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import time
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -19,6 +21,23 @@ STATUS_PRIVILEGE_NOT_HELD = 0xC0000061
 
 # Debug mode flag - set to False to hide debug logs
 DEBUG_MODE = False
+
+_CONFIG_DIR_NAME = "WindowsRAMMapHelper"
+_CONFIG_FILE_NAME = "config.json"
+
+INTERVAL_OPTIONS = [
+    ("5 min", 5),
+    ("15 min", 15),
+    ("30 min", 30),
+    ("1 hour", 60),
+    ("2 hours", 120),
+    ("4 hours", 240),
+    ("8 hours", 480),
+]
+INTERVAL_LABELS = [label for label, _ in INTERVAL_OPTIONS]
+INTERVAL_BY_LABEL = {label: minutes for label, minutes in INTERVAL_OPTIONS}
+LABEL_BY_INTERVAL = {minutes: label for label, minutes in INTERVAL_OPTIONS}
+_DEFAULT_INTERVAL_MIN = 30
 
 
 def get_resource_path(relative_path):
@@ -156,8 +175,8 @@ class RamMapApp(tk.Tk):
         self.title("Windows RAMMap Helper")
 
         # Window size calculations
-        self.collapsed_height = 425  # Height when logs are hidden (just show button with padding)
-        self.expanded_height = 750   # Height when logs are shown (20 lines * ~15px + padding)
+        self.collapsed_height = 440
+        self.expanded_height = 765
 
         self.geometry(f"520x{self.collapsed_height}")
         self.resizable(False, False)
@@ -191,6 +210,14 @@ class RamMapApp(tk.Tk):
         # System tray setup
         self.tray_icon = None
         self.is_closing = False
+
+        # Auto-purge state (loaded from config below)
+        self._auto_purge_enabled = False
+        self._auto_purge_interval_min = _DEFAULT_INTERVAL_MIN
+        self._auto_purge_after_id = None
+        self._countdown_after_id = None
+        self._next_purge_time = None
+        self._load_config()
 
         # Override window close behavior to hide to tray
         self.protocol("WM_DELETE_WINDOW", self.on_window_close)
@@ -294,6 +321,44 @@ class RamMapApp(tk.Tk):
         )
         self.refresh_button.grid(row=3, column=0, sticky="ew")
 
+        # --- Auto-purge controls (compact row below the two columns) ---
+        auto_purge_frame = ttk.Frame(root)
+        auto_purge_frame.pack(pady=(0, 0))
+
+        self._auto_purge_var = tk.BooleanVar(value=self._auto_purge_enabled)
+        self.auto_purge_checkbox = tk.Checkbutton(
+            auto_purge_frame,
+            text="Auto-purge standby",
+            variable=self._auto_purge_var,
+            command=self._on_auto_purge_checkbox_changed,
+            font=("Segoe UI", 9),
+        )
+        self.auto_purge_checkbox.pack(side="left")
+
+        ttk.Label(auto_purge_frame, text="Every:", font=("Segoe UI", 9)).pack(
+            side="left", padx=(12, 6),
+        )
+        self.interval_combobox = ttk.Combobox(
+            auto_purge_frame,
+            values=INTERVAL_LABELS,
+            state="readonly",
+            width=10,
+            font=("Segoe UI", 9),
+        )
+        self.interval_combobox.set(
+            LABEL_BY_INTERVAL.get(self._auto_purge_interval_min, "30 min")
+        )
+        self.interval_combobox.pack(side="left")
+        self.interval_combobox.bind("<<ComboboxSelected>>", self._on_interval_changed)
+
+        ttk.Style().configure(
+            'Countdown.TLabel', foreground='#888888', font=("Segoe UI", 8),
+        )
+        self.countdown_label = ttk.Label(
+            auto_purge_frame, text="", style='Countdown.TLabel',
+        )
+        self.countdown_label.pack(side="left", padx=(12, 0))
+
         # Administrator status with better styling
         admin_status = is_admin()
         admin_text = "Yes" if admin_status else "No (run as Administrator recommended)"
@@ -345,6 +410,11 @@ class RamMapApp(tk.Tk):
 
         # Create system tray icon
         self.after(100, self._create_tray_icon)
+
+        # Start auto-purge if enabled from saved config
+        if self._auto_purge_enabled:
+            self._start_auto_purge()
+        self._update_countdown_display()
 
     def _create_legend(self) -> None:
         """Create the memory legend items in the right column."""
@@ -433,6 +503,147 @@ class RamMapApp(tk.Tk):
                 "[Error] Could not check privilege status."
             )
 
+    # --- Config persistence ---------------------------------------------------
+
+    @staticmethod
+    def _get_config_path() -> str:
+        appdata = os.environ.get("APPDATA", "")
+        return os.path.join(appdata, _CONFIG_DIR_NAME, _CONFIG_FILE_NAME)
+
+    def _load_config(self) -> None:
+        try:
+            path = self._get_config_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._auto_purge_enabled = bool(data.get("auto_purge_enabled", False))
+                interval = int(data.get("auto_purge_interval_minutes", _DEFAULT_INTERVAL_MIN))
+                if interval in LABEL_BY_INTERVAL:
+                    self._auto_purge_interval_min = interval
+        except Exception:
+            pass
+
+    def _save_config(self) -> None:
+        try:
+            path = self._get_config_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = {
+                "auto_purge_enabled": self._auto_purge_enabled,
+                "auto_purge_interval_minutes": self._auto_purge_interval_min,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self._write_log(f"[Warning] Could not save config: {e}")
+
+    # --- Auto-purge timer -----------------------------------------------------
+
+    def _start_auto_purge(self) -> None:
+        self._stop_auto_purge()
+        self._auto_purge_enabled = True
+        interval_s = self._auto_purge_interval_min * 60
+        self._next_purge_time = time.time() + interval_s
+        self._auto_purge_after_id = self.after(interval_s * 1000, self._on_auto_purge_tick)
+
+    def _stop_auto_purge(self) -> None:
+        if self._auto_purge_after_id is not None:
+            self.after_cancel(self._auto_purge_after_id)
+            self._auto_purge_after_id = None
+        self._next_purge_time = None
+
+    def _on_auto_purge_tick(self) -> None:
+        self._write_log("[Auto-purge] Purging standby list...")
+
+        def task() -> None:
+            status = purge_standby_list()
+            if status == 0:
+                self.after(0, self._write_log, "[Auto-purge] Standby list purged successfully.")
+                self.after(0, self.refresh_memory_stats)
+            else:
+                hex_status = f"0x{status & 0xFFFFFFFF:08X}"
+                self.after(0, self._write_log, f"[Auto-purge] Purge failed. NTSTATUS: {hex_status}")
+
+        self._run_in_background(task)
+
+        if self._auto_purge_enabled:
+            interval_s = self._auto_purge_interval_min * 60
+            self._next_purge_time = time.time() + interval_s
+            self._auto_purge_after_id = self.after(interval_s * 1000, self._on_auto_purge_tick)
+
+    def _reset_auto_purge_timer(self) -> None:
+        if self._auto_purge_enabled:
+            self._start_auto_purge()
+
+    # --- Countdown display ----------------------------------------------------
+
+    def _update_countdown_display(self) -> None:
+        if self._auto_purge_enabled and self._next_purge_time is not None:
+            remaining = max(0, self._next_purge_time - time.time())
+            minutes, seconds = divmod(int(remaining), 60)
+            hours, minutes = divmod(minutes, 60)
+            if hours > 0:
+                countdown = f"{hours}:{minutes:02d}:{seconds:02d}"
+            else:
+                countdown = f"{minutes}:{seconds:02d}"
+            self.countdown_label.config(text=f"Next in {countdown}")
+            self._update_tray_tooltip(countdown)
+        else:
+            self.countdown_label.config(text="")
+            self._update_tray_tooltip(None)
+        self._countdown_after_id = self.after(1000, self._update_countdown_display)
+
+    def _update_tray_tooltip(self, countdown: str | None) -> None:
+        if self.tray_icon is None:
+            return
+        base = "Windows RAMMap Helper"
+        if countdown:
+            self.tray_icon.title = f"{base}\nAuto-purge in {countdown}"
+        else:
+            self.tray_icon.title = base
+
+    # --- Auto-purge toggle handlers -------------------------------------------
+
+    def _on_auto_purge_checkbox_changed(self) -> None:
+        enabled = self._auto_purge_var.get()
+        self._auto_purge_enabled = enabled
+        if enabled:
+            self._start_auto_purge()
+            interval_text = LABEL_BY_INTERVAL.get(self._auto_purge_interval_min, "?")
+            self._write_log(f"Auto-purge enabled (every {interval_text}).")
+        else:
+            self._stop_auto_purge()
+            self._write_log("Auto-purge disabled.")
+        self._save_config()
+
+    def _on_interval_changed(self, event=None) -> None:
+        label = self.interval_combobox.get()
+        minutes = INTERVAL_BY_LABEL.get(label)
+        if minutes is None:
+            return
+        self._auto_purge_interval_min = minutes
+        if self._auto_purge_enabled:
+            self._start_auto_purge()
+            self._write_log(f"Auto-purge interval changed to {label}.")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _toggle_auto_purge_from_tray(self, icon=None, item=None) -> None:
+        """Called from pystray thread -- flip the flag immediately for the
+        checked callback, then schedule UI/timer work on the main thread."""
+        self._auto_purge_enabled = not self._auto_purge_enabled
+        self.after(0, self._apply_auto_purge_state_from_tray)
+
+    def _apply_auto_purge_state_from_tray(self) -> None:
+        self._auto_purge_var.set(self._auto_purge_enabled)
+        if self._auto_purge_enabled:
+            self._start_auto_purge()
+            interval_text = LABEL_BY_INTERVAL.get(self._auto_purge_interval_min, "?")
+            self._write_log(f"Auto-purge enabled from tray (every {interval_text}).")
+        else:
+            self._stop_auto_purge()
+            self._write_log("Auto-purge disabled from tray.")
+        self._save_config()
+
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         self.trim_button.config(state=state)
@@ -469,6 +680,7 @@ class RamMapApp(tk.Tk):
             if status == 0:
                 self.after(0, self._write_log, "Standby list purged successfully.")
                 self.after(0, self.refresh_memory_stats)
+                self.after(0, self._reset_auto_purge_timer)
                 return
 
             hex_status = f"0x{status & 0xFFFFFFFF:08X}"
@@ -537,28 +749,39 @@ class RamMapApp(tk.Tk):
 
     def _create_tray_icon(self) -> None:
         """Create the system tray icon with menu."""
-        # Create a simple icon image
         icon_image = self._create_icon_image()
 
-        # Create menu for the tray icon
-        menu = pystray.Menu(
-            pystray.MenuItem("Show", self.show_window, default=True),
-            pystray.MenuItem("Exit", self.quit_app)
-        )
-
-        # Create the tray icon
         self.tray_icon = pystray.Icon(
             "windows_rammap",
             icon_image,
             "Windows RAMMap Helper",
-            menu
+            self._build_tray_menu(),
         )
 
-        # Run the tray icon in a separate thread
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
-
-        # Show the window after tray icon is created
         self.after(100, self.show_window)
+
+    def _build_tray_menu(self) -> pystray.Menu:
+        def auto_purge_label(item):
+            interval = LABEL_BY_INTERVAL.get(self._auto_purge_interval_min, "?")
+            return f"Auto-purge (every {interval})"
+
+        return pystray.Menu(
+            pystray.MenuItem("Show", self.show_window, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                auto_purge_label,
+                self._toggle_auto_purge_from_tray,
+                checked=lambda item: self._auto_purge_enabled,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", self.quit_app),
+        )
+
+    def _rebuild_tray_menu(self) -> None:
+        if self.tray_icon is not None:
+            self.tray_icon.menu = self._build_tray_menu()
+            self.tray_icon.update_menu()
 
     def _create_icon_image(self) -> Image.Image:
         """Load the application icon for the system tray."""
@@ -764,6 +987,13 @@ class RamMapApp(tk.Tk):
                      foreground=[('disabled', '#666666'), ('active', '#ffffff'), ('pressed', '#ffffff')],
                      bordercolor=[('active', '#606060')])
             style.configure('TSeparator', background='#3c3c3c')
+            style.configure('TCombobox',
+                          fieldbackground='#404040', background='#404040',
+                          foreground='#e0e0e0', arrowcolor='#e0e0e0')
+            style.map('TCombobox',
+                     fieldbackground=[('readonly', '#404040')],
+                     foreground=[('readonly', '#e0e0e0')])
+            style.configure('Countdown.TLabel', background='#2b2b2b', foreground='#999999')
         else:
             # Light mode colors - dark text on light background for readability
             style.configure('TFrame', background='#f0f0f0')
@@ -782,6 +1012,13 @@ class RamMapApp(tk.Tk):
                      background=[('disabled', '#f0f0f0'), ('active', '#e5f1fb'), ('pressed', '#cce4f7')],
                      foreground=[('disabled', '#a0a0a0'), ('active', '#000000'), ('pressed', '#000000')])
             style.configure('TSeparator', background='#d9d9d9')
+            style.configure('TCombobox',
+                          fieldbackground='white', background='#e1e1e1',
+                          foreground='#000000', arrowcolor='#000000')
+            style.map('TCombobox',
+                     fieldbackground=[('readonly', 'white')],
+                     foreground=[('readonly', '#000000')])
+            style.configure('Countdown.TLabel', background='#f0f0f0', foreground='#888888')
 
         # Force update of all widgets to apply new styles immediately
         self.update_idletasks()
@@ -800,10 +1037,16 @@ class RamMapApp(tk.Tk):
             button_active_bg = '#e5f1fb'
             button_active_fg = '#000000'
 
-        # Apply colors to all buttons
+        # Apply colors to all tk.Buttons
         for btn in [self.trim_button, self.modified_button, self.standby_button,
                    self.refresh_button, self.logs_toggle_button, self.theme_toggle_button]:
             btn.config(bg=button_bg, fg=button_fg,
                       activebackground=button_active_bg, activeforeground=button_active_fg)
+
+        self.auto_purge_checkbox.config(
+            bg=button_bg, fg=button_fg,
+            activebackground=button_active_bg, activeforeground=button_active_fg,
+            selectcolor=button_bg,
+        )
 
         self._write_log(f"Theme switched to {'dark' if self.dark_mode else 'light'} mode.")
